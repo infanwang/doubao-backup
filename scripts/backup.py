@@ -132,12 +132,24 @@ def create_driver(headless=False, login_mode=False):
 
     chrome = "/snap/chromium/current/usr/lib/chromium-browser/chrome"
     chromedriver = "/snap/chromium/current/usr/lib/chromium-browser/chromedriver"
-    if os.path.exists(chrome):
+    if os.path.exists(chrome) and os.path.exists(chromedriver):
         options.binary_location = chrome
         service = Service(executable_path=chromedriver)
         driver = webdriver.Chrome(service=service, options=options)
     else:
-        driver = webdriver.Chrome(options=options)
+        # 尝试其他路径
+        for chrome_path, driver_path in [
+            ("/usr/bin/chromium-browser", "/usr/bin/chromedriver"),
+            ("/usr/bin/google-chrome", "/usr/bin/chromedriver"),
+        ]:
+            if os.path.exists(chrome_path):
+                options.binary_location = chrome_path
+                if os.path.exists(driver_path):
+                    service = Service(executable_path=driver_path)
+                    driver = webdriver.Chrome(service=service, options=options)
+                    break
+        else:
+            raise Exception("未找到 Chrome/Chromium 浏览器，请安装后重试")
 
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -168,55 +180,70 @@ def scrape_chat_list(driver):
     time.sleep(3)
     
     try:
-        # 豆包的聊天列表选择器（需要根据实际页面调整）
+        # 豆包左侧栏的聊天历史选择器
         chats = driver.execute_script("""
             const chats = [];
+            const seen = new Set();
             
-            // 尝试多种选择器
-            const selectors = [
-                // 豆包可能的聊天列表选择器
-                'div[class*="conversation"] div[class*="item"]',
-                'div[class*="chat-list"] div',
-                'div[class*="sidebar"] a',
-                'div[class*="session"] div',
-                'ul li a[href*="chat"]',
-                // 通用选择器
-                '[class*="history"] div',
-                '[class*="recent"] div',
-            ];
+            // 方法1: 查找左侧栏的可点击历史项
+            // 豆包的聊天历史通常在 nav 或 aside 中，有 href 或点击事件
+            document.querySelectorAll('nav a, aside a, [class*="sidebar"] a, [class*="history"] a').forEach(el => {
+                const text = (el.innerText || '').trim();
+                const href = el.getAttribute('href') || '';
+                const rect = el.getBoundingClientRect();
+                
+                // 左侧栏（x < 280），有文字，是链接
+                if (text && text.length > 1 && text.length < 80 && rect.x < 280 && href.includes('chat')) {
+                    const key = text + href;
+                    if (!seen.has(key)) {
+                        seen.add(key);
+                        chats.push({
+                            chat_id: href.split('/').filter(Boolean).pop() || '',
+                            title: text.substring(0, 100),
+                            href: href
+                        });
+                    }
+                }
+            });
             
-            for (const sel of selectors) {
-                const items = document.querySelectorAll(sel);
-                if (items.length > 0) {
-                    items.forEach(item => {
-                        const text = item.innerText.trim();
-                        const href = item.getAttribute('href') || '';
-                        if (text && text.length > 1 && text.length < 100) {
+            // 方法2: 如果方法1没找到，查找左侧栏所有可点击元素
+            if (chats.length === 0) {
+                document.querySelectorAll('[class*="sidebar"] div[class*="item"], [class*="sidebar"] div[class*="history"]').forEach(el => {
+                    const text = (el.innerText || '').trim();
+                    const rect = el.getBoundingClientRect();
+                    const href = el.getAttribute('href') || el.querySelector('a')?.getAttribute('href') || '';
+                    
+                    if (text && text.length > 1 && text.length < 80 && rect.x < 280 && rect.height > 20) {
+                        const key = text;
+                        if (!seen.has(key)) {
+                            seen.add(key);
                             chats.push({
-                                chat_id: href.includes('/') ? href.split('/').pop() : '',
+                                chat_id: href ? href.split('/').filter(Boolean).pop() : '',
                                 title: text.substring(0, 100),
                                 href: href
                             });
                         }
-                    });
-                    if (chats.length > 0) break;
-                }
+                    }
+                });
             }
             
-            // 如果上面没找到，尝试更通用的方式
+            // 方法3: 最后尝试，查找所有左侧区域的文本元素
             if (chats.length === 0) {
-                // 查找所有可点击的文本元素
                 document.querySelectorAll('div, span, a').forEach(el => {
-                    const text = el.innerText.trim();
+                    const text = (el.innerText || '').trim();
                     const rect = el.getBoundingClientRect();
-                    // 只要左侧边栏的元素（x < 300）
-                    if (text && text.length > 2 && text.length < 50 && rect.x < 300 && rect.width > 50) {
-                        const href = el.getAttribute('href') || '';
-                        chats.push({
-                            chat_id: href ? href.split('/').pop() : '',
-                            title: text,
-                            href: href
-                        });
+                    const clickable = el.onclick || el.getAttribute('role') === 'button' || el.tagName === 'A';
+                    
+                    if (text && text.length > 2 && text.length < 50 && rect.x < 250 && rect.width > 50 && rect.height > 20 && rect.height < 80 && clickable) {
+                        const key = text;
+                        if (!seen.has(key)) {
+                            seen.add(key);
+                            chats.push({
+                                chat_id: '',
+                                title: text,
+                                href: ''
+                            });
+                        }
                     }
                 });
             }
@@ -226,16 +253,22 @@ def scrape_chat_list(driver):
     except Exception as e:
         print(f"[!] 抓取聊天列表失败: {e}")
     
+    # 过滤掉菜单项
+    menu_items = {'新对话', '新办公任务', 'AI 创作', '关于豆包', '快速', '新', 'PPT 生成', '图像生成', '帮我写作', '视频生成', '翻译', '深入研究', '录音转写', '更多'}
+    chats = [c for c in chats if c['title'] not in menu_items and not c['title'].startswith('下载')]
+    
     if chats:
         print(f"[i] 找到 {len(chats)} 个聊天")
     return chats
 
 
 def scrape_chat_content(driver, chat_url):
-    """抓取单个聊天的消息内容。"""
+    """抓取单个聊天的消息内容。需要先点击对话，再抓取消息。"""
     try:
-        driver.get(chat_url)
-        time.sleep(5)  # 等待页面加载
+        # 如果有聊天链接，先导航过去
+        if chat_url and "doubao.com" in chat_url:
+            driver.get(chat_url)
+            time.sleep(4)
         
         # 滚动加载所有消息
         for _ in range(20):
@@ -248,39 +281,47 @@ def scrape_chat_content(driver, chat_url):
         # 抓取消息内容
         messages = driver.execute_script("""
             const msgs = [];
+            const seen = new Set();
             
-            // 豆包的消息选择器（需要根据实际页面调整）
-            const selectors = [
-                'div[class*="message"]',
-                'div[class*="chat-message"]',
-                'div[class*="bubble"]',
-                'div[class*="content"]',
-                '[data-testid*="message"]',
+            // 豆包的消息容器选择器
+            const messageSelectors = [
+                '[class*="message-item"]',
+                '[class*="chat-message"]',
+                '[class*="bubble"]',
+                '[class*="msg-content"]',
+                '[class*="message"]',
             ];
             
-            let els = [];
-            for (const sel of selectors) {
-                els = document.querySelectorAll(sel);
-                if (els.length > 0) break;
+            let messageElements = [];
+            for (const sel of messageSelectors) {
+                messageElements = document.querySelectorAll(sel);
+                if (messageElements.length > 0) break;
             }
             
-            els.forEach(el => {
-                const text = el.innerText.trim();
+            messageElements.forEach(el => {
+                const text = (el.innerText || '').trim();
                 if (!text || text.length < 2) return;
+                
+                // 避免重复
+                if (seen.has(text)) return;
+                seen.add(text);
                 
                 const cls = el.className || '';
                 let role = 'unknown';
                 
                 // 豆包的消息角色判断
-                if (cls.includes('user') || cls.includes('human') || cls.includes('self')) {
+                if (cls.includes('user') || cls.includes('human') || cls.includes('self') || cls.includes('right')) {
                     role = 'user';
-                } else if (cls.includes('assistant') || cls.includes('bot') || cls.includes('ai') || cls.includes('doubao')) {
+                } else if (cls.includes('assistant') || cls.includes('bot') || cls.includes('ai') || cls.includes('doubao') || cls.includes('left')) {
                     role = 'assistant';
                 } else {
-                    // 根据位置判断
-                    const allMsgs = document.querySelectorAll('[class*="message"], [class*="bubble"]');
-                    const idx = Array.from(allMsgs).indexOf(el);
-                    role = idx % 2 === 0 ? 'user' : 'assistant';
+                    // 根据位置判断（右侧=用户，左侧=AI）
+                    const rect = el.getBoundingClientRect();
+                    if (rect.x > window.innerWidth / 2) {
+                        role = 'user';
+                    } else {
+                        role = 'assistant';
+                    }
                 }
                 
                 msgs.push({ role, content: text });
@@ -423,14 +464,32 @@ def do_backup(full=False, pii=False, rate_limit=2.0):
         
         print(f"[{i+1}/{len(chat_list)}] {title[:50]}...")
         
-        chat_url = chat.get("href", "")
-        if chat_url and not chat_url.startswith("http"):
-            chat_url = "https://www.doubao.com" + chat_url
-        elif not chat_url:
-            chat_url = f"https://www.doubao.com/chat/{chat_id}"
-        
+        # 点击侧边栏的对话项来加载消息
         try:
-            messages = limiter.retry(scrape_chat_content, driver, chat_url)
+            clicked = driver.execute_script(f"""
+                // 查找包含标题文本的侧边栏元素并点击
+                const title = arguments[0];
+                const elements = document.querySelectorAll('nav a, aside a, [class*="sidebar"] a, [class*="history"] a, [class*="sidebar"] div');
+                for (const el of elements) {{
+                    const text = (el.innerText || '').trim();
+                    if (text === title || text.includes(title)) {{
+                        el.click();
+                        return true;
+                    }}
+                }}
+                return false;
+            """, title)
+            
+            if clicked:
+                time.sleep(3)  # 等待消息加载
+            else:
+                print(f"  [!] 未找到可点击的对话项，尝试直接导航...")
+        except Exception as e:
+            print(f"  [!] 点击失败: {e}")
+        
+        # 抓取消息
+        try:
+            messages = limiter.retry(scrape_chat_content, driver, driver.current_url)
         except Exception as e:
             print(f"[✗] 抓取失败: {e}")
             continue
@@ -440,7 +499,7 @@ def do_backup(full=False, pii=False, rate_limit=2.0):
         chat_data = {
             "chat_id": chat_id,
             "title": title,
-            "url": chat_url,
+            "url": driver.current_url,
             "scraped_at": datetime.now(timezone.utc).isoformat(),
             "content_hash": content_hash,
             "messages": messages,
