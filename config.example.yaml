@@ -1,0 +1,20 @@
+# Doubao Chat Backup Configuration
+
+# Backup storage directory
+backup_dir: ~/doubao-backups
+
+# Doubao URL
+doubao_url: https://www.doubao.com
+
+# PII desensitization
+pii_desensitize: false
+
+# Rate limiting (seconds between requests)
+rate_limit_seconds: 2.0
+
+# Export formats
+export_formats:
+  - markdown
+  - word
+  - json
+  - html
